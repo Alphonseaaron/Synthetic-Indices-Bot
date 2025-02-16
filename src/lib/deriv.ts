@@ -3,7 +3,9 @@ import Decimal from 'decimal.js';
 import { create } from 'zustand';
 
 const APP_ID = 1089;
-const WS_URL = 'wss://ws.binaryws.com/websockets/v3';
+const WS_URL = `wss://ws.binaryws.com/websockets/v3?app_id=${APP_ID}`;
+const PING_INTERVAL = 30000; // 30 seconds
+const RECONNECT_DELAY = 5000; // 5 seconds
 
 interface DerivState {
   connection: WebSocket | null;
@@ -11,6 +13,7 @@ interface DerivState {
   activeSymbol: string;
   ticks: number[];
   isAuthorized: boolean;
+  isConnecting: boolean;
   connect: () => Promise<void>;
   disconnect: () => void;
   subscribeToTicks: (symbol: string) => void;
@@ -21,6 +24,28 @@ interface DerivState {
 export const useDerivStore = create<DerivState>((set, get) => {
   let socket: WebSocket | null = null;
   let ticksSubscription: any = null;
+  let pingInterval: NodeJS.Timeout | null = null;
+  let reconnectTimeout: NodeJS.Timeout | null = null;
+
+  const clearTimeouts = () => {
+    if (pingInterval) {
+      clearInterval(pingInterval);
+      pingInterval = null;
+    }
+    if (reconnectTimeout) {
+      clearTimeout(reconnectTimeout);
+      reconnectTimeout = null;
+    }
+  };
+
+  const setupPingInterval = () => {
+    if (pingInterval) clearInterval(pingInterval);
+    pingInterval = setInterval(() => {
+      if (socket?.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ ping: 1 }));
+      }
+    }, PING_INTERVAL);
+  };
 
   const send = (request: any): Promise<any> => {
     return new Promise((resolve, reject) => {
@@ -29,24 +54,53 @@ export const useDerivStore = create<DerivState>((set, get) => {
         return;
       }
 
-      const requestId = Math.random().toString(36);
+      const requestId = Math.random().toString(36).substring(2, 15);
       const message = { ...request, req_id: requestId };
 
+      let messageTimeout = setTimeout(() => {
+        socket?.removeEventListener('message', handleMessage);
+        reject(new Error('Request timeout'));
+      }, 10000);
+
       const handleMessage = (response: any) => {
-        const data = JSON.parse(response.data.toString());
-        if (data.req_id === requestId) {
-          socket?.removeEventListener('message', handleMessage);
-          if (data.error) {
-            reject(data.error);
-          } else {
-            resolve(data);
+        try {
+          const data = JSON.parse(response.data.toString());
+          if (data.req_id === requestId) {
+            clearTimeout(messageTimeout);
+            socket?.removeEventListener('message', handleMessage);
+            if (data.error) {
+              reject(new Error(data.error.message));
+            } else {
+              resolve(data);
+            }
           }
+        } catch (error) {
+          clearTimeout(messageTimeout);
+          reject(new Error('Failed to parse WebSocket message'));
         }
       };
 
       socket.addEventListener('message', handleMessage);
-      socket.send(JSON.stringify(message));
+      
+      try {
+        socket.send(JSON.stringify(message));
+      } catch (error) {
+        clearTimeout(messageTimeout);
+        reject(new Error('Failed to send message'));
+      }
     });
+  };
+
+  const handleSocketError = (error: any) => {
+    console.error('WebSocket error:', error);
+    set({ isAuthorized: false, isConnecting: false });
+    clearTimeouts();
+    
+    reconnectTimeout = setTimeout(() => {
+      if (get().connection) {
+        get().connect();
+      }
+    }, RECONNECT_DELAY);
   };
 
   return {
@@ -55,45 +109,79 @@ export const useDerivStore = create<DerivState>((set, get) => {
     activeSymbol: 'R_100',
     ticks: [],
     isAuthorized: false,
+    isConnecting: false,
 
     connect: async () => {
-      try {
-        if (socket) {
-          socket.close();
-        }
+      return new Promise((resolve, reject) => {
+        try {
+          if (socket) {
+            socket.close();
+            clearTimeouts();
+          }
 
-        socket = new WebSocket(WS_URL);
-        
-        await new Promise((resolve, reject) => {
-          socket!.onopen = () => {
+          set({ isConnecting: true });
+          socket = new WebSocket(WS_URL);
+          
+          const connectionTimeout = setTimeout(() => {
+            if (socket?.readyState !== WebSocket.OPEN) {
+              socket?.close();
+              set({ isConnecting: false });
+              reject(new Error('Connection timeout'));
+            }
+          }, 10000);
+
+          socket.onopen = () => {
+            clearTimeout(connectionTimeout);
             console.log('Connected to Deriv WebSocket API');
-            resolve(true);
+            setupPingInterval();
+            set({ connection: socket, isConnecting: false });
+            resolve();
           };
-          socket!.onerror = (error) => {
-            console.error('WebSocket error:', error);
-            reject(error);
-          };
-        });
 
-        set({ connection: socket });
-      } catch (error) {
-        console.error('Failed to connect:', error);
-        setTimeout(() => {
-          get().connect();
-        }, 5000);
-      }
+          socket.onerror = handleSocketError;
+
+          socket.onclose = () => {
+            console.log('WebSocket connection closed');
+            set({ isAuthorized: false, connection: null, isConnecting: false });
+            clearTimeouts();
+            
+            // Attempt to reconnect if not explicitly disconnected
+            if (get().connection) {
+              reconnectTimeout = setTimeout(() => {
+                get().connect();
+              }, RECONNECT_DELAY);
+            }
+          };
+
+        } catch (error) {
+          console.error('Failed to connect:', error);
+          set({ isConnecting: false });
+          reject(error);
+        }
+      });
     },
 
     disconnect: () => {
+      clearTimeouts();
       if (socket) {
         socket.close();
         socket = null;
-        set({ connection: null, isAuthorized: false });
+        set({ 
+          connection: null, 
+          isAuthorized: false, 
+          isConnecting: false,
+          balance: 0,
+          ticks: []
+        });
       }
     },
 
     authorize: async (token: string) => {
       try {
+        if (!socket || socket.readyState !== WebSocket.OPEN) {
+          await get().connect();
+        }
+
         const response = await send({
           authorize: token,
           app_id: APP_ID
@@ -103,16 +191,19 @@ export const useDerivStore = create<DerivState>((set, get) => {
           throw new Error(response.error.message);
         }
 
-        // Get initial balance and subscribe to updates
         const balanceResponse = await send({
           balance: 1,
           subscribe: 1
         });
 
         socket!.addEventListener('message', (event) => {
-          const data = JSON.parse(event.data.toString());
-          if (data.msg_type === 'balance') {
-            set({ balance: new Decimal(data.balance.balance).toNumber() });
+          try {
+            const data = JSON.parse(event.data.toString());
+            if (data.msg_type === 'balance') {
+              set({ balance: new Decimal(data.balance.balance).toNumber() });
+            }
+          } catch (error) {
+            console.error('Failed to parse balance update:', error);
           }
         });
 
@@ -125,11 +216,16 @@ export const useDerivStore = create<DerivState>((set, get) => {
       } catch (error) {
         console.error('Authorization failed:', error);
         set({ isAuthorized: false });
+        throw error;
       }
     },
 
     subscribeToTicks: async (symbol: string) => {
       try {
+        if (!socket || socket.readyState !== WebSocket.OPEN) {
+          await get().connect();
+        }
+
         if (ticksSubscription) {
           await send({ forget: ticksSubscription });
           ticksSubscription = null;
@@ -143,11 +239,15 @@ export const useDerivStore = create<DerivState>((set, get) => {
         ticksSubscription = response.subscription?.id;
 
         socket!.addEventListener('message', (event) => {
-          const data = JSON.parse(event.data.toString());
-          if (data.msg_type === 'tick' && data.tick.symbol === symbol) {
-            set(state => ({
-              ticks: [...state.ticks.slice(-19), Number(data.tick.quote)]
-            }));
+          try {
+            const data = JSON.parse(event.data.toString());
+            if (data.msg_type === 'tick' && data.tick.symbol === symbol) {
+              set(state => ({
+                ticks: [...state.ticks.slice(-19), Number(data.tick.quote)]
+              }));
+            }
+          } catch (error) {
+            console.error('Failed to parse tick data:', error);
           }
         });
 
@@ -155,8 +255,10 @@ export const useDerivStore = create<DerivState>((set, get) => {
       } catch (error) {
         console.error('Failed to subscribe to ticks:', error);
         setTimeout(() => {
-          get().subscribeToTicks(symbol);
-        }, 5000);
+          if (get().isAuthorized) {
+            get().subscribeToTicks(symbol);
+          }
+        }, RECONNECT_DELAY);
       }
     },
 

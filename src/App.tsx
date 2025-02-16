@@ -2,16 +2,15 @@ import React, { useState, useEffect } from 'react';
 import { Pattern, Trade } from './types';
 import { PatternCard } from './components/PatternCard';
 import { TradesList } from './components/TradesList';
-import { Bot, PauseCircle, PlayCircle, AlertCircle } from 'lucide-react';
+import { Bot, PauseCircle, PlayCircle, AlertCircle, Key } from 'lucide-react';
 import { useDerivStore } from './lib/deriv';
 import { analyzePatterns, calculateStakeAmount } from './lib/patterns';
 import { placeTrade } from './lib/trading';
 
-const API_TOKEN = 'zxPtNisG7NStj1D';
-
 function App() {
   const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [apiKey, setApiKey] = useState('QgYEDe3oa3tei5a');
   const { 
     connect, 
     disconnect, 
@@ -55,7 +54,7 @@ function App() {
   useEffect(() => {
     // Initialize connection
     connect().then(() => {
-      authorize(API_TOKEN).catch(err => {
+      authorize(apiKey).catch(err => {
         setError('Authorization failed. Please check your API token.');
         console.error(err);
       });
@@ -67,7 +66,7 @@ function App() {
     return () => {
       disconnect();
     };
-  }, []);
+  }, [apiKey]); // Re-run when API key changes
 
   useEffect(() => {
     if (!isRunning || !isAuthorized) return;
@@ -125,6 +124,14 @@ function App() {
     setIsRunning(!isRunning);
   };
 
+  const handleApiKeyChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setApiKey(e.target.value);
+    setError(null); // Clear any previous errors
+    if (isRunning) {
+      setIsRunning(false); // Stop the bot when API key changes
+    }
+  };
+
   return (
     <div className="min-h-screen bg-gray-100 p-6">
       <div className="max-w-6xl mx-auto">
@@ -141,6 +148,16 @@ function App() {
             </div>
           </div>
           <div className="flex items-center gap-4">
+            <div className="flex items-center gap-2 bg-white rounded-lg px-3 py-2 shadow-sm border border-gray-200">
+              <Key className="w-4 h-4 text-gray-400" />
+              <input
+                type="text"
+                value={apiKey}
+                onChange={handleApiKeyChange}
+                placeholder="Enter API Key"
+                className="border-none focus:ring-0 text-sm text-gray-700 placeholder-gray-400 w-48"
+              />
+            </div>
             {error && (
               <div className="flex items-center gap-2 text-red-600">
                 <AlertCircle className="w-5 h-5" />
